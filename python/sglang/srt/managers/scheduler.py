@@ -110,6 +110,14 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    ToolEndReqInput,
+    ToolEndReqOutput,
+    ToolStartReqInput,
+    ToolStartReqOutput,
+    GetKVMetaReqInput,
+    GetKVMetaReqOutput,
+    ListActiveRequestsReqInput,
+    ListActiveRequestsReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
     UpdateWeightFromDiskReqInput,
@@ -118,6 +126,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
+from sglang.srt.managers.tool_kv_manager import ToolKVManager, SessionKVState
 from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -629,6 +638,11 @@ class Scheduler(
                 (GetLoadReqInput, self.get_load),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
+                # Tool KV management
+                (ToolStartReqInput, self.handle_tool_start),
+                (ToolEndReqInput, self.handle_tool_end),
+                (GetKVMetaReqInput, self.handle_get_kv_meta),
+                (ListActiveRequestsReqInput, self.handle_list_active_requests),
             ]
         )
 
@@ -2631,6 +2645,14 @@ class Scheduler(
         if session_id not in self.sessions:
             logger.warning(f"session id {session_id} does not exist, cannot delete.")
         else:
+            # Clean up any ToolKVManager CPU backups for this session.
+            try:
+                if hasattr(self, "_tool_kv_manager"):
+                    self._tool_kv_manager.cleanup_session(session_id)
+            except Exception:
+                logger.exception(
+                    f"Failed to cleanup ToolKVManager resources for session {session_id}"
+                )
             del self.sessions[session_id]
 
     def get_print_prefix(self):
@@ -2655,6 +2677,92 @@ class Scheduler(
         freeze_gc("Scheduler")
         self.send_to_detokenizer.send_output(recv_req, recv_req)
         return None
+
+    # =========================================================================
+    # Tool KV Management (TOOL_START / TOOL_END)
+    # =========================================================================
+
+    def _get_tool_kv_manager(self) -> ToolKVManager:
+        """Lazily initialize the ToolKVManager."""
+        if not hasattr(self, '_tool_kv_manager'):
+            self._tool_kv_manager = ToolKVManager(self)
+        return self._tool_kv_manager
+
+    def handle_tool_start(self, recv_req: ToolStartReqInput) -> ToolStartReqOutput:
+        """
+        Handle TOOL_START request: pause generation and offload KV to CPU.
+        
+        This is called when an external orchestrator needs to execute a tool
+        and wants to free GPU memory during tool execution.
+        """
+        tool_kv_mgr = self._get_tool_kv_manager()
+        result = tool_kv_mgr.tool_start(
+            session_id=recv_req.session_id,
+            mode=recv_req.mode,
+            rid=recv_req.target_rid,
+        )
+        return ToolStartReqOutput(
+            ok=result.ok,
+            session_id=result.session_id,
+            state=result.state,
+            kv_bytes=result.kv_bytes,
+            epoch=result.epoch,
+            error=result.error,
+        )
+
+    def handle_tool_end(self, recv_req: ToolEndReqInput) -> ToolEndReqOutput:
+        """
+        Handle TOOL_END request: restore KV to GPU and resume generation.
+        
+        This is called when tool execution completes and generation should resume.
+        """
+        tool_kv_mgr = self._get_tool_kv_manager()
+        result = tool_kv_mgr.tool_end(
+            session_id=recv_req.session_id,
+            epoch=recv_req.epoch,
+            tool_result=recv_req.tool_result,
+        )
+        return ToolEndReqOutput(
+            ok=result.ok,
+            session_id=result.session_id,
+            state=result.state,
+            epoch=result.epoch,
+            error=result.error,
+        )
+
+    def handle_get_kv_meta(self, recv_req: GetKVMetaReqInput) -> GetKVMetaReqOutput:
+        """
+        Handle GET_KV_META request: return KV cache metadata for debugging.
+        """
+        tool_kv_mgr = self._get_tool_kv_manager()
+        meta = tool_kv_mgr.get_kv_meta(recv_req.session_id)
+        
+        if meta is None:
+            return GetKVMetaReqOutput(
+                session_id=recv_req.session_id,
+                state="NOT_FOUND",
+                error=f"Session {recv_req.session_id} not found in ToolKVManager",
+            )
+        
+        return GetKVMetaReqOutput(
+            session_id=meta.session_id,
+            state=meta.state.value,
+            tier=meta.tier,
+            kv_bytes=meta.kv_bytes,
+            seq_len=meta.seq_len,
+            epoch=meta.epoch,
+            last_access=meta.last_access,
+        )
+
+    def handle_list_active_requests(
+        self, recv_req: ListActiveRequestsReqInput
+    ) -> ListActiveRequestsReqOutput:
+        """
+        Handle LIST_ACTIVE_REQUESTS request: return list of all active requests.
+        """
+        tool_kv_mgr = self._get_tool_kv_manager()
+        requests = tool_kv_mgr.list_active_requests()
+        return ListActiveRequestsReqOutput(requests=requests)
 
 
 class IdleSleeper:

@@ -104,6 +104,9 @@ from sglang.srt.managers.io_struct import (
     SeparateReasoningReqInput,
     SetInternalStateReq,
     SlowDownReqInput,
+    ToolEndReqInput,
+    ToolStartReqInput,
+    GetKVMetaReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
@@ -1051,6 +1054,128 @@ async def close_session(obj: CloseSessionReqInput, request: Request):
         await _global_state.tokenizer_manager.close_session(obj, request)
         return Response(status_code=200)
     except Exception as e:
+        return _create_error_response(e)
+
+
+# ============================================================================
+# Tool KV Management Endpoints (TOOL_START / TOOL_END)
+# ============================================================================
+
+
+@app.post("/session/tool_start")
+async def session_tool_start(obj: ToolStartReqInput, request: Request):
+    """
+    Pause generation for a session and offload KV cache to CPU.
+
+    This endpoint is called by an external agent/orchestrator when it needs to
+    execute a tool and wants to free GPU memory during tool execution.
+
+    Request body:
+        - session_id: The session to pause. Use "*" to target any running request.
+        - mode: "cpu" (default) or "storage" (not yet implemented)
+        - target_rid: Optional request ID to target a specific request
+
+    Response:
+        - ok: Whether the operation succeeded
+        - session_id: The session ID
+        - state: Current state ("OFFLOADED_TO_CPU" on success)
+        - kv_bytes: Size of offloaded KV cache in bytes
+        - epoch: Version number (required for tool_end)
+        - error: Error message if failed
+    """
+    try:
+        result = await _global_state.tokenizer_manager.tool_start(obj, request)
+        # Convert dataclass to dict for JSON response
+        content = {
+            "ok": result.ok,
+            "session_id": result.session_id,
+            "state": result.state,
+            "kv_bytes": result.kv_bytes,
+            "epoch": result.epoch,
+            "error": result.error,
+        }
+        return ORJSONResponse(content=content, status_code=200 if result.ok else 400)
+    except Exception as e:
+        logger.exception(f"Error in tool_start for session {obj.session_id}")
+        return _create_error_response(e)
+
+
+@app.post("/session/tool_end")
+async def session_tool_end(obj: ToolEndReqInput, request: Request):
+    """
+    Restore KV cache to GPU and resume generation for a session.
+
+    This endpoint is called by an external agent/orchestrator after tool execution
+    completes and generation should resume.
+
+    Request body:
+        - session_id: The session to resume
+        - epoch: Must match the epoch returned by tool_start (prevents stale resumes)
+        - tool_result: Optional tool output to append to conversation
+
+    Response:
+        - ok: Whether the operation succeeded
+        - session_id: The session ID
+        - state: Current state ("RUNNABLE" on success)
+        - epoch: Current version number
+        - error: Error message if failed
+    """
+    try:
+        result = await _global_state.tokenizer_manager.tool_end(obj, request)
+        # Convert dataclass to dict for JSON response
+        content = {
+            "ok": result.ok,
+            "session_id": result.session_id,
+            "state": result.state,
+            "epoch": result.epoch,
+            "error": result.error,
+        }
+        return ORJSONResponse(content=content, status_code=200 if result.ok else 400)
+    except Exception as e:
+        logger.exception(f"Error in tool_end for session {obj.session_id}")
+        return _create_error_response(e)
+
+
+@app.get("/session/kv_meta")
+async def session_kv_meta(session_id: str, request: Request):
+    """
+    Get KV cache metadata for a session (debugging endpoint).
+    
+    Query parameters:
+        - session_id: The session to query
+    
+    Response:
+        - session_id: The session ID
+        - state: Current state (RUNNABLE, OFFLOADED_TO_CPU, etc.)
+        - tier: Where KV is stored (GPU, CPU, STORAGE)
+        - kv_bytes: Size of KV cache in bytes
+        - seq_len: Sequence length
+        - epoch: Current version number
+        - last_access: Timestamp of last access
+        - error: Error message if session not found
+    """
+    try:
+        obj = GetKVMetaReqInput(session_id=session_id)
+        result = await _global_state.tokenizer_manager.get_kv_meta(obj, request)
+        return ORJSONResponse(content=result.__dict__, status_code=200)
+    except Exception as e:
+        logger.exception(f"Error in get_kv_meta for session {session_id}")
+        return _create_error_response(e)
+
+
+@app.get("/session/list_active_requests")
+async def list_active_requests(request: Request):
+    """
+    List all active requests in the scheduler (debugging endpoint).
+    
+    Response:
+        - requests: List of active requests with their rid, session_id, location, seq_len
+    """
+    try:
+        result = await _global_state.tokenizer_manager.list_active_requests(request)
+        return ORJSONResponse(content={"requests": result}, status_code=200)
+    except Exception as e:
+        logger.exception("Error in list_active_requests")
         return _create_error_response(e)
 
 

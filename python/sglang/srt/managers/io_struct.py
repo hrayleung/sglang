@@ -1651,6 +1651,79 @@ class LazyDumpTensorsReqOutput(BaseReq):
     success: bool
 
 
+# ============================================================================
+# Tool KV Management (TOOL_START / TOOL_END)
+# ============================================================================
+
+
+@dataclass
+class ToolStartReqInput(BaseReq):
+    """Request to pause generation and offload KV cache to CPU."""
+    session_id: str
+    mode: str = "cpu"  # "cpu" or "storage" (storage not yet implemented)
+    target_rid: Optional[str] = None  # Optional: target specific request by ID
+
+
+@dataclass
+class ToolStartReqOutput(BaseReq):
+    """Response from tool_start operation."""
+    ok: bool
+    session_id: str
+    state: str
+    kv_bytes: int = 0
+    epoch: int = 0
+    error: Optional[str] = None
+
+
+@dataclass
+class ToolEndReqInput(BaseReq):
+    """Request to restore KV cache to GPU and resume generation."""
+    session_id: str
+    epoch: int
+    tool_result: Optional[str] = None
+
+
+@dataclass
+class ToolEndReqOutput(BaseReq):
+    """Response from tool_end operation."""
+    ok: bool
+    session_id: str
+    state: str
+    epoch: int = 0
+    error: Optional[str] = None
+
+
+@dataclass
+class GetKVMetaReqInput(BaseReq):
+    """Request to get KV cache metadata for a session."""
+    session_id: str
+
+
+@dataclass
+class GetKVMetaReqOutput(BaseReq):
+    """Response with KV cache metadata."""
+    session_id: str
+    state: str
+    tier: str = "GPU"
+    kv_bytes: int = 0
+    seq_len: int = 0
+    epoch: int = 0
+    last_access: float = 0.0
+    error: Optional[str] = None
+
+
+@dataclass
+class ListActiveRequestsReqInput(BaseReq):
+    """Request to list all active requests."""
+    pass
+
+
+@dataclass
+class ListActiveRequestsReqOutput(BaseReq):
+    """Response with list of active requests."""
+    requests: list = None  # List of dicts with rid, session_id, location, seq_len
+
+
 def _check_all_req_types():
     """A helper function to check all request types are defined in this file."""
     import inspect

@@ -37,6 +37,8 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
+    GetKVMetaReqInput,
+    GetKVMetaReqOutput,
     GetLoadReqInput,
     GetLoadReqOutput,
     GetWeightsByNameReqInput,
@@ -45,6 +47,8 @@ from sglang.srt.managers.io_struct import (
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    ListActiveRequestsReqInput,
+    ListActiveRequestsReqOutput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
@@ -62,6 +66,10 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReqOutput,
     SlowDownReqInput,
     SlowDownReqOutput,
+    ToolEndReqInput,
+    ToolEndReqOutput,
+    ToolStartReqInput,
+    ToolStartReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
     UpdateWeightsFromDistributedReqInput,
@@ -216,6 +224,20 @@ class TokenizerCommunicatorMixin:
         self.get_load_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size, mode="watching"
         )
+        
+        # Tool KV management communicators
+        self.tool_start_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.tool_end_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.get_kv_meta_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.list_active_requests_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
 
         self._result_dispatcher += self._get_communicator_dispatcher()
 
@@ -301,6 +323,23 @@ class TokenizerCommunicatorMixin:
                 (
                     GetLoadReqOutput,
                     self.get_load_communicator.handle_recv,
+                ),
+                # Tool KV management
+                (
+                    ToolStartReqOutput,
+                    self.tool_start_communicator.handle_recv,
+                ),
+                (
+                    ToolEndReqOutput,
+                    self.tool_end_communicator.handle_recv,
+                ),
+                (
+                    GetKVMetaReqOutput,
+                    self.get_kv_meta_communicator.handle_recv,
+                ),
+                (
+                    ListActiveRequestsReqOutput,
+                    self.list_active_requests_communicator.handle_recv,
                 ),
             ]
         )
@@ -779,3 +818,63 @@ class TokenizerCommunicatorMixin:
         """Update weight version if provided."""
         if weight_version is not None:
             self.server_args.weight_version = weight_version
+
+    # =========================================================================
+    # Tool KV Management (TOOL_START / TOOL_END)
+    # =========================================================================
+
+    async def tool_start(
+        self: TokenizerManager,
+        obj: ToolStartReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> ToolStartReqOutput:
+        """
+        Handle TOOL_START request: pause generation and offload KV to CPU.
+
+        This sends the request to the scheduler which owns the session's KV cache.
+        """
+        self.auto_create_handle_loop()
+        # The communicator's __call__ method sends the object and waits for response
+        result = await self.tool_start_communicator(obj)
+        return result[0] if isinstance(result, list) else result
+
+    async def tool_end(
+        self: TokenizerManager,
+        obj: ToolEndReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> ToolEndReqOutput:
+        """
+        Handle TOOL_END request: restore KV to GPU and resume generation.
+
+        This sends the request to the scheduler which owns the session's KV cache.
+        """
+        self.auto_create_handle_loop()
+        # The communicator's __call__ method sends the object and waits for response
+        result = await self.tool_end_communicator(obj)
+        return result[0] if isinstance(result, list) else result
+
+    async def get_kv_meta(
+        self: TokenizerManager,
+        obj: GetKVMetaReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> GetKVMetaReqOutput:
+        """
+        Get KV cache metadata for a session.
+        """
+        self.auto_create_handle_loop()
+        # The communicator's __call__ method sends the object and waits for response
+        result = await self.get_kv_meta_communicator(obj)
+        return result[0] if isinstance(result, list) else result
+
+    async def list_active_requests(
+        self: TokenizerManager,
+        request: Optional[fastapi.Request] = None,
+    ) -> list:
+        """
+        List all active requests in the scheduler.
+        """
+        self.auto_create_handle_loop()
+        obj = ListActiveRequestsReqInput()
+        result = await self.list_active_requests_communicator(obj)
+        result = result[0] if isinstance(result, list) else result
+        return result.requests if result.requests else []
