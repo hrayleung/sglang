@@ -344,7 +344,8 @@ class ToolKVManager:
 
         extra_key = getattr(req, "extra_key", None)
         is_bigram = bool(getattr(tree_cache, "is_eagle", False))
-        radix_key = RadixKey(token_ids=token_ids, extra_key=extra_key, is_bigram=False)
+        # Use the detected is_bigram value for consistency
+        radix_key = RadixKey(token_ids=token_ids, extra_key=extra_key, is_bigram=is_bigram)
         match = tree_cache.match_prefix(radix_key)
         device_indices = match.device_indices
         leaf = match.last_device_node
@@ -402,10 +403,27 @@ class ToolKVManager:
         available_before = self.scheduler.token_to_kv_pool_allocator.available_size()
 
         # Backup KV to CPU.
+        # NOTE: PagedTokenToKVPoolAllocator may return None (not implemented).
         kv_cache_cpu = self.scheduler.token_to_kv_pool_allocator.get_cpu_copy(pruned_indices)
+        if kv_cache_cpu is None:
+            return ToolStartResult(
+                ok=False,
+                session_id=session_id,
+                state="ERROR",
+                error="KV cache CPU copy not supported by current allocator (paged allocator?)",
+            )
         kv_bytes = self._sum_tensor_bytes(kv_cache_cpu)
+        if kv_bytes == 0:
+            return ToolStartResult(
+                ok=False,
+                session_id=session_id,
+                state="ERROR",
+                error="KV cache backup resulted in 0 bytes; backup may have failed",
+            )
 
         # Free GPU KV by pruning the radix tree branch (leaf->root order).
+        # NOTE: This assumes single-threaded scheduler access. If concurrent eviction
+        # is possible, nodes should be locked before backup.
         for node in nodes_to_delete:
             self.scheduler.token_to_kv_pool_allocator.free(node.value)
             self._delete_radix_leaf(tree_cache, node)
@@ -481,18 +499,39 @@ class ToolKVManager:
         if new_indices is None:
             return f"Not enough free KV cache to restore {missing_len} tokens"
 
-        self.scheduler.token_to_kv_pool_allocator.load_cpu_copy(meta._kv_cache_cpu, new_indices)
+        # Validate allocated length matches expected
+        if len(new_indices) != missing_len:
+            self.scheduler.token_to_kv_pool_allocator.free(new_indices)
+            return f"Allocated indices length mismatch ({len(new_indices)} != {missing_len})"
 
-        full_indices = (
-            torch.cat([existing, new_indices]) if prefix_len > 0 else new_indices
-        )
-        if len(full_indices) != total_len:
-            return f"Internal error: restored indices length mismatch ({len(full_indices)} != {total_len})"
+        # Use try/finally to ensure cleanup on failure
+        try:
+            self.scheduler.token_to_kv_pool_allocator.load_cpu_copy(meta._kv_cache_cpu, new_indices)
 
-        if not hasattr(tree_cache, "insert"):
-            return "Prefix cache does not support insert(); cannot restore"
+            full_indices = (
+                torch.cat([existing, new_indices]) if prefix_len > 0 else new_indices
+            )
+            if len(full_indices) != total_len:
+                raise RuntimeError(
+                    f"Internal error: restored indices length mismatch ({len(full_indices)} != {total_len})"
+                )
 
-        tree_cache.insert(radix_key, full_indices)
+            if not hasattr(tree_cache, "insert"):
+                raise RuntimeError("Prefix cache does not support insert(); cannot restore")
+
+            # Check insert return value - it returns number of tokens inserted
+            inserted = tree_cache.insert(radix_key, full_indices)
+            if inserted == 0 and missing_len > 0:
+                logger.warning(
+                    f"RadixCache insert returned 0 for session {meta.session_id}, "
+                    f"expected to insert {missing_len} tokens. Key may already exist."
+                )
+
+        except Exception as e:
+            # Cleanup: free allocated indices on failure
+            logger.error(f"Failed to restore KV for session {meta.session_id}: {e}")
+            self.scheduler.token_to_kv_pool_allocator.free(new_indices)
+            return f"Failed to restore KV: {str(e)}"
 
         # Clear CPU backup to release memory.
         meta._kv_cache_cpu = None
@@ -899,21 +938,56 @@ class ToolKVManager:
             )
     
     def cleanup_session(self, session_id: str):
-        """Clean up all resources for a session."""
+        """Clean up all resources for a session.
+        
+        This method is designed to be robust - it will attempt to clean up
+        all resources even if individual cleanup steps fail.
+        """
         with self.lock:
-            if session_id in self.session_kv_meta:
-                meta = self.session_kv_meta[session_id]
+            if session_id not in self.session_kv_meta:
+                return
                 
-                # Clear CPU tensors
+            meta = self.session_kv_meta[session_id]
+            cleanup_errors = []
+            
+            # Clear CPU tensors - each in its own try/except to ensure all are attempted
+            try:
                 if meta._k_host is not None:
                     del meta._k_host
+                    meta._k_host = None
+            except Exception as e:
+                cleanup_errors.append(f"_k_host: {e}")
+                
+            try:
                 if meta._v_host is not None:
                     del meta._v_host
+                    meta._v_host = None
+            except Exception as e:
+                cleanup_errors.append(f"_v_host: {e}")
+                
+            try:
                 if meta._kv_host is not None:
                     del meta._kv_host
+                    meta._kv_host = None
+            except Exception as e:
+                cleanup_errors.append(f"_kv_host: {e}")
 
+            try:
                 if meta._kv_cache_cpu is not None:
                     meta._kv_cache_cpu = None
-                
+            except Exception as e:
+                cleanup_errors.append(f"_kv_cache_cpu: {e}")
+            
+            # Always remove from tracking dict
+            try:
                 del self.session_kv_meta[session_id]
+            except Exception as e:
+                cleanup_errors.append(f"session_kv_meta removal: {e}")
+            
+            if cleanup_errors:
+                logger.warning(
+                    f"Partial cleanup errors for session {session_id}: {cleanup_errors}"
+                )
+            else:
                 logger.info(f"Cleaned up ToolKVManager resources for session {session_id}")
+
