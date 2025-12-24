@@ -370,6 +370,117 @@ class HiRadixCache(RadixCache):
         node.value = None
         return num_evicted
 
+    def offload_for_tool(self, node: TreeNode, protect: bool = True) -> int:
+        """
+        Synchronously backup node to CPU and free GPU memory.
+        Used by ToolKVManager for tool-calling offload.
+
+        This method:
+        1. Writes the node's KV cache to CPU (host memory)
+        2. Waits for the async write to complete
+        3. Frees the GPU memory while keeping the node in the tree
+        4. Optionally protects the CPU memory from LRU eviction
+
+        Args:
+            node: The TreeNode to offload
+            protect: If True, call protect_host() to prevent CPU eviction
+
+        Returns:
+            Number of tokens offloaded, or 0 on failure
+        """
+        if node.evicted:
+            # Already evicted from GPU
+            if node.backuped:
+                if protect:
+                    node.protect_host()
+                return len(node.host_value) if node.host_value is not None else 0
+            return 0
+
+        if node.value is None:
+            logger.warning(f"Node {node.id} has no GPU value to offload")
+            return 0
+
+        num_tokens = len(node.value)
+
+        # Step 1: Write backup (GPU→CPU)
+        written_len = self.write_backup(node, write_back=False)
+        if written_len == 0:
+            logger.error(f"Failed to write backup for node {node.id}")
+            return 0
+
+        # Step 2: Wait for async write to complete
+        # This ensures the data is safely on CPU before we free GPU memory
+        self.writing_check(write_back=False)
+
+        # Step 3: Verify backup completed for this node
+        if node.id not in self.ongoing_write_through:
+            # write_backup succeeded and writing_check acknowledged it
+            pass
+        else:
+            # Still in ongoing - wait more explicitly
+            while node.id in self.ongoing_write_through:
+                self.writing_check(write_back=False)
+
+        if not node.backuped:
+            logger.error(f"Node {node.id} backup verification failed")
+            return 0
+
+        # Step 4: Evict from GPU (keep in CPU)
+        self._evict_backuped(node)
+
+        # Step 5: Protect from CPU eviction if requested
+        if protect:
+            node.protect_host()
+
+        logger.debug(
+            f"Offloaded node {node.id} for tool: {num_tokens} tokens to CPU"
+        )
+        return num_tokens
+
+    def preload_for_tool(self, node: TreeNode, release: bool = True) -> bool:
+        """
+        Restore node from CPU to GPU for tool-calling preload.
+
+        This method:
+        1. Calls load_back() to restore KV cache to GPU
+        2. Waits for the async load to complete
+        3. Optionally releases the CPU protection
+
+        Args:
+            node: The TreeNode to preload
+            release: If True, call release_host() after loading
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if not node.evicted:
+            # Already on GPU
+            if release and node.host_ref_counter > 0:
+                node.release_host()
+            return True
+
+        if not node.backuped:
+            logger.error(f"Node {node.id} has no CPU backup to load")
+            return False
+
+        # Load back from CPU to GPU
+        device_indices = self.load_back(node)
+        if device_indices is None:
+            logger.error(f"Failed to load back node {node.id}: OOM or threshold")
+            return False
+
+        # Wait for async load to complete
+        self.loading_check()
+
+        # Release CPU protection if requested
+        if release and node.host_ref_counter > 0:
+            node.release_host()
+
+        logger.debug(
+            f"Preloaded node {node.id} for tool: {len(device_indices)} tokens to GPU"
+        )
+        return True
+
     def _evict_regular(self, node: TreeNode):
         # evict a node not initiated write to host
         self.cache_controller.mem_pool_device_allocator.free(node.value)

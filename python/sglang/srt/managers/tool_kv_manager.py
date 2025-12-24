@@ -991,3 +991,431 @@ class ToolKVManager:
             else:
                 logger.info(f"Cleaned up ToolKVManager resources for session {session_id}")
 
+
+class ToolKVManagerV2:
+    """
+    Native HiRadixCache integration for tool-calling KV management.
+    
+    This version uses HiRadixCache primitives instead of shadow copy:
+    - offload_for_tool() for GPU→CPU backup + eviction
+    - preload_for_tool() for CPU→GPU restoration
+    - protect_host()/release_host() for semantic locking
+    
+    Benefits:
+    - Preserves Radix Attention prefix sharing
+    - Leverages SGLang's existing eviction policies
+    - No duplicate data management
+    
+    Requirements:
+    - HiRadixCache must be enabled (--enable-hierarchical-cache)
+    """
+    
+    # Session TTL: 1 hour (prevents memory leaks if agent crashes)
+    SESSION_TTL_SECONDS = 3600
+    
+    def __init__(self, scheduler: "Scheduler"):
+        self.scheduler = scheduler
+        self.lock = threading.RLock()
+        
+        # Session to last radix node mapping
+        self.session_to_last_node: Dict[str, TreeNode] = {}
+        
+        # Track offload timestamps for TTL-based cleanup
+        self.offload_timestamps: Dict[str, float] = {}
+        
+        # Session metadata (for API compatibility)
+        self.session_meta: Dict[str, SessionKVMeta] = {}
+        
+        # Check if HiRadixCache is available
+        self._hicache_available = self._check_hicache()
+        
+        logger.info(
+            f"ToolKVManagerV2 initialized. HiCache enabled: {self._hicache_available}"
+        )
+    
+    def _check_hicache(self) -> bool:
+        """Check if HiRadixCache is available."""
+        tree_cache = getattr(self.scheduler, "tree_cache", None)
+        if tree_cache is None:
+            return False
+        # Check for HiRadixCache-specific methods
+        return hasattr(tree_cache, "offload_for_tool") and hasattr(tree_cache, "preload_for_tool")
+    
+    def _get_hicache(self):
+        """Get HiRadixCache instance or None."""
+        if not self._hicache_available:
+            return None
+        return getattr(self.scheduler, "tree_cache", None)
+    
+    def _get_or_create_meta(self, session_id: str) -> SessionKVMeta:
+        """Get or create session metadata."""
+        if session_id not in self.session_meta:
+            self.session_meta[session_id] = SessionKVMeta(session_id=session_id)
+        return self.session_meta[session_id]
+    
+    def _find_session_node(
+        self, session_id: str, rid: Optional[str] = None
+    ) -> Optional[TreeNode]:
+        """
+        Find the radix tree node for a session.
+        
+        First checks the cached mapping, then falls back to searching
+        through the session's request history.
+        """
+        # Check cached mapping first
+        if session_id in self.session_to_last_node:
+            node = self.session_to_last_node[session_id]
+            # Validate node is still valid (not garbage collected)
+            if node is not None and hasattr(node, 'id'):
+                return node
+        
+        # Fall back to session-based lookup
+        session = getattr(self.scheduler, "sessions", {}).get(session_id)
+        if session is None:
+            return None
+        
+        req_nodes = getattr(session, "req_nodes", None)
+        if not req_nodes:
+            return None
+        
+        # Find the request's last_node
+        if rid is not None:
+            node_info = req_nodes.get(rid)
+            if node_info is not None:
+                req = getattr(node_info, "req", None)
+                if req is not None:
+                    return getattr(req, "last_node", None)
+        
+        # Find the most recent request's last_node
+        for node_info in reversed(list(req_nodes.values())):
+            req = getattr(node_info, "req", None)
+            if req is not None:
+                last_node = getattr(req, "last_node", None)
+                if last_node is not None:
+                    return last_node
+        
+        return None
+    
+    def _estimate_kv_bytes(self, num_tokens: int) -> int:
+        """Estimate KV cache size in bytes."""
+        try:
+            kv_cache = self.scheduler.token_to_kv_pool_allocator.get_kvcache()
+            if hasattr(kv_cache, 'k_buffer') and len(kv_cache.k_buffer) > 0:
+                # MHA style: k_buffer + v_buffer
+                k_shape = kv_cache.k_buffer[0].shape
+                num_layers = len(kv_cache.k_buffer)
+                bytes_per_layer = k_shape[1:].numel() * kv_cache.k_buffer[0].element_size()
+                return num_tokens * num_layers * bytes_per_layer * 2  # k + v
+            elif hasattr(kv_cache, 'kv_buffer') and len(kv_cache.kv_buffer) > 0:
+                # MLA style: kv_buffer
+                kv_shape = kv_cache.kv_buffer[0].shape
+                num_layers = len(kv_cache.kv_buffer)
+                bytes_per_layer = kv_shape[1:].numel() * kv_cache.kv_buffer[0].element_size()
+                return num_tokens * num_layers * bytes_per_layer
+        except Exception:
+            pass
+        # Fallback: rough estimate (FP16, 32 layers, 128 heads * 128 dim)
+        return num_tokens * 32 * 128 * 128 * 2 * 2
+    
+    def tool_start(
+        self,
+        session_id: str,
+        mode: str = "cpu",
+        rid: Optional[str] = None,
+    ) -> ToolStartResult:
+        """
+        Handle TOOL_START request: offload KV to CPU using HiRadixCache.
+        
+        Flow:
+        1. Find the session's last node in the radix tree
+        2. Call offload_for_tool() to backup and evict GPU memory
+        3. The node remains in the tree but with value=None (evicted)
+        4. CPU memory is protected via protect_host()
+        
+        Args:
+            session_id: Session to pause
+            mode: Offload mode (only "cpu" supported)
+            rid: Optional specific request ID
+        """
+        try:
+            if mode != "cpu":
+                return ToolStartResult(
+                    ok=False,
+                    session_id=session_id,
+                    state="ERROR",
+                    error=f"Unsupported mode: {mode}. Only 'cpu' is supported."
+                )
+            
+            with self.lock:
+                tree_cache = self._get_hicache()
+                if tree_cache is None:
+                    return ToolStartResult(
+                        ok=False,
+                        session_id=session_id,
+                        state="ERROR",
+                        error="HiRadixCache not enabled. Use --enable-hierarchical-cache"
+                    )
+                
+                # Find the session's last node
+                node = self._find_session_node(session_id, rid)
+                if node is None:
+                    return ToolStartResult(
+                        ok=False,
+                        session_id=session_id,
+                        state="ERROR",
+                        error=f"Session {session_id} not found or has no radix node"
+                    )
+                
+                # Check if already offloaded
+                if session_id in self.offload_timestamps:
+                    meta = self.session_meta.get(session_id)
+                    if meta and meta.state == SessionKVState.OFFLOADED_TO_CPU:
+                        return ToolStartResult(
+                            ok=True,
+                            session_id=session_id,
+                            state=meta.state.value,
+                            kv_bytes=meta.kv_bytes,
+                            epoch=meta.epoch,
+                        )
+                
+                # Offload using HiRadixCache primitive
+                num_tokens = tree_cache.offload_for_tool(node, protect=True)
+                if num_tokens == 0:
+                    return ToolStartResult(
+                        ok=False,
+                        session_id=session_id,
+                        state="ERROR",
+                        error="Failed to offload: node may be locked or already evicted without backup"
+                    )
+                
+                # Track session
+                self.session_to_last_node[session_id] = node
+                self.offload_timestamps[session_id] = time.time()
+                
+                # Update metadata
+                meta = self._get_or_create_meta(session_id)
+                meta.state = SessionKVState.OFFLOADED_TO_CPU
+                meta.tier = "CPU"
+                meta.epoch += 1
+                meta.last_access = time.time()
+                meta.seq_len = num_tokens
+                meta.kv_bytes = self._estimate_kv_bytes(num_tokens)
+                meta.rid = rid
+                
+                logger.info(
+                    f"Offloaded session {session_id} to CPU via HiRadixCache: "
+                    f"tokens={num_tokens}, node_id={node.id}, epoch={meta.epoch}"
+                )
+                
+                return ToolStartResult(
+                    ok=True,
+                    session_id=session_id,
+                    state=meta.state.value,
+                    kv_bytes=meta.kv_bytes,
+                    epoch=meta.epoch,
+                )
+        
+        except Exception as e:
+            logger.exception(f"Unexpected error in tool_start for session {session_id}")
+            return ToolStartResult(
+                ok=False,
+                session_id=session_id,
+                state="ERROR",
+                error=f"Internal error: {str(e)}",
+            )
+    
+    def tool_end(
+        self,
+        session_id: str,
+        epoch: int,
+        tool_result: Optional[str] = None,
+    ) -> ToolEndResult:
+        """
+        Handle TOOL_END request: restore KV from CPU to GPU using HiRadixCache.
+        
+        Flow:
+        1. Validate epoch
+        2. Call preload_for_tool() to restore CPU→GPU
+        3. Release CPU protection via release_host()
+        
+        Args:
+            session_id: Session to resume
+            epoch: Expected epoch (must match)
+            tool_result: Optional tool output (stored for future use)
+        """
+        try:
+            with self.lock:
+                if session_id not in self.session_to_last_node:
+                    return ToolEndResult(
+                        ok=False,
+                        session_id=session_id,
+                        state="ERROR",
+                        error=f"Session {session_id} not found in offload tracking"
+                    )
+                
+                meta = self.session_meta.get(session_id)
+                if meta and meta.epoch != epoch:
+                    return ToolEndResult(
+                        ok=False,
+                        session_id=session_id,
+                        state="ERROR",
+                        error=f"Epoch mismatch: expected {epoch}, got {meta.epoch}"
+                    )
+                
+                tree_cache = self._get_hicache()
+                if tree_cache is None:
+                    return ToolEndResult(
+                        ok=False,
+                        session_id=session_id,
+                        state="ERROR",
+                        error="HiRadixCache not enabled"
+                    )
+                
+                node = self.session_to_last_node[session_id]
+                
+                # Store tool result for future use
+                if tool_result and meta:
+                    meta._pending_tool_result = tool_result
+                
+                # Preload using HiRadixCache primitive
+                success = tree_cache.preload_for_tool(node, release=True)
+                if not success:
+                    return ToolEndResult(
+                        ok=False,
+                        session_id=session_id,
+                        state="ERROR",
+                        epoch=epoch,
+                        error="Failed to preload: OOM or node has no backup"
+                    )
+                
+                # Cleanup tracking
+                del self.session_to_last_node[session_id]
+                del self.offload_timestamps[session_id]
+                
+                # Update metadata
+                if meta:
+                    meta.state = SessionKVState.RUNNABLE
+                    meta.tier = "GPU"
+                    meta.last_access = time.time()
+                
+                logger.info(
+                    f"Preloaded session {session_id} to GPU via HiRadixCache: "
+                    f"node_id={node.id}, epoch={epoch}"
+                )
+                
+                return ToolEndResult(
+                    ok=True,
+                    session_id=session_id,
+                    state="RUNNABLE",
+                    epoch=epoch,
+                )
+        
+        except Exception as e:
+            logger.exception(f"Unexpected error in tool_end for session {session_id}")
+            return ToolEndResult(
+                ok=False,
+                session_id=session_id,
+                state="ERROR",
+                error=f"Internal error: {str(e)}",
+            )
+    
+    def cleanup_stale_sessions(self) -> int:
+        """
+        Clean up sessions that have exceeded TTL.
+        
+        This prevents memory leaks if the agent crashes and never sends tool_end.
+        Should be called periodically (e.g., every minute).
+        
+        Returns:
+            Number of sessions cleaned up
+        """
+        now = time.time()
+        stale_sessions = []
+        
+        with self.lock:
+            for session_id, ts in self.offload_timestamps.items():
+                if now - ts > self.SESSION_TTL_SECONDS:
+                    stale_sessions.append(session_id)
+            
+            for session_id in stale_sessions:
+                logger.warning(
+                    f"Session {session_id} exceeded TTL ({self.SESSION_TTL_SECONDS}s), "
+                    f"cleaning up to prevent memory leak"
+                )
+                try:
+                    node = self.session_to_last_node.get(session_id)
+                    if node is not None and node.host_ref_counter > 0:
+                        node.release_host()
+                        logger.info(f"Released host lock for stale session {session_id}")
+                except Exception as e:
+                    logger.error(f"Failed to release host for session {session_id}: {e}")
+                
+                self.session_to_last_node.pop(session_id, None)
+                self.offload_timestamps.pop(session_id, None)
+                meta = self.session_meta.pop(session_id, None)
+                if meta:
+                    meta.state = SessionKVState.INVALID
+        
+        return len(stale_sessions)
+    
+    def cleanup_session(self, session_id: str):
+        """
+        Clean up a specific session.
+        
+        Called when a session is closed to release any held resources.
+        """
+        with self.lock:
+            if session_id in self.session_to_last_node:
+                try:
+                    node = self.session_to_last_node[session_id]
+                    if node is not None and node.host_ref_counter > 0:
+                        node.release_host()
+                except Exception as e:
+                    logger.warning(f"Failed to release host for session {session_id}: {e}")
+                
+                del self.session_to_last_node[session_id]
+            
+            self.offload_timestamps.pop(session_id, None)
+            self.session_meta.pop(session_id, None)
+            logger.info(f"Cleaned up ToolKVManagerV2 resources for session {session_id}")
+    
+    def get_kv_meta(self, session_id: str) -> Optional[SessionKVMeta]:
+        """Get KV metadata for a session."""
+        with self.lock:
+            return self.session_meta.get(session_id)
+    
+    def list_active_requests(self) -> list:
+        """List all active requests (for debugging)."""
+        # Delegate to scheduler's running state
+        requests = []
+        
+        if self.scheduler.running_batch:
+            for req in self.scheduler.running_batch.reqs:
+                requests.append({
+                    "rid": req.rid,
+                    "session_id": getattr(req, 'session_id', None),
+                    "location": "running_batch",
+                    "seq_len": len(req.origin_input_ids) + len(req.output_ids),
+                    "output_len": len(req.output_ids),
+                })
+        
+        return requests
+    
+    def update_session_node(self, session_id: str, node: TreeNode):
+        """
+        Update the session-to-node mapping.
+        
+        Called after a request finishes to track the latest radix node.
+        """
+        with self.lock:
+            self.session_to_last_node[session_id] = node
+    
+    @property
+    def offloaded_session_count(self) -> int:
+        """Number of sessions currently offloaded."""
+        return len(self.offload_timestamps)
+    
+    @property
+    def session_kv_meta(self) -> Dict[str, SessionKVMeta]:
+        """Compatibility property for old API."""
+        return self.session_meta

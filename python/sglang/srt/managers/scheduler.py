@@ -126,7 +126,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
-from sglang.srt.managers.tool_kv_manager import ToolKVManager, SessionKVState
+from sglang.srt.managers.tool_kv_manager import ToolKVManager, ToolKVManagerV2, SessionKVState
 from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -2682,10 +2682,28 @@ class Scheduler(
     # Tool KV Management (TOOL_START / TOOL_END)
     # =========================================================================
 
-    def _get_tool_kv_manager(self) -> ToolKVManager:
-        """Lazily initialize the ToolKVManager."""
+    def _get_tool_kv_manager(self):
+        """
+        Lazily initialize the ToolKVManager.
+        
+        Uses ToolKVManagerV2 (native HiRadixCache integration) when HiRadixCache
+        is enabled, otherwise falls back to the original ToolKVManager.
+        """
         if not hasattr(self, '_tool_kv_manager'):
-            self._tool_kv_manager = ToolKVManager(self)
+            # Check if HiRadixCache is enabled
+            tree_cache = getattr(self, "tree_cache", None)
+            use_v2 = (
+                tree_cache is not None
+                and hasattr(tree_cache, "offload_for_tool")
+                and hasattr(tree_cache, "preload_for_tool")
+            )
+            
+            if use_v2:
+                self._tool_kv_manager = ToolKVManagerV2(self)
+                logger.info("Using ToolKVManagerV2 (native HiRadixCache integration)")
+            else:
+                self._tool_kv_manager = ToolKVManager(self)
+                logger.info("Using ToolKVManager (shadow copy mode)")
         return self._tool_kv_manager
 
     def handle_tool_start(self, recv_req: ToolStartReqInput) -> ToolStartReqOutput:
