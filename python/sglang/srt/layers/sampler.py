@@ -38,6 +38,7 @@ class Sampler(nn.Module):
         super().__init__()
         self.use_nan_detection = get_global_server_args().enable_nan_detection
         self.tp_sync_group = get_tp_group().device_group
+        self._logged_invalid_logits = False
 
         if is_dp_attention_enabled():
             self.tp_sync_group = get_attention_tp_group().device_group
@@ -50,14 +51,18 @@ class Sampler(nn.Module):
         if sampling_info.has_custom_logit_processor:
             apply_custom_logit_processor(logits, sampling_info)
 
-        # Detect and handle NaN values in logits
-        if self.use_nan_detection and torch.any(torch.isnan(logits)):
-            logger.warning("Detected errors during sampling! NaN in the logits.")
-            logits = torch.where(
-                torch.isnan(logits), torch.full_like(logits, -1e5), logits
+        # Detect and sanitize non-finite logits to avoid invalid probabilities.
+        has_invalid = torch.any(~torch.isfinite(logits))
+        if has_invalid:
+            if not self._logged_invalid_logits:
+                logger.warning("Detected non-finite logits during sampling; sanitizing.")
+                self._logged_invalid_logits = True
+            finfo = torch.finfo(logits.dtype)
+            logits = torch.nan_to_num(
+                logits, nan=0.0, posinf=finfo.max, neginf=finfo.min
             )
-            if crash_on_warnings():
-                raise ValueError("Detected errors during sampling! NaN in the logits.")
+            if self.use_nan_detection and crash_on_warnings():
+                raise ValueError("Detected errors during sampling! NaN or Inf in logits.")
 
         return logits
 

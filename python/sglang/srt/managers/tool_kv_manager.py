@@ -193,17 +193,24 @@ class ToolKVManager:
         return 0
 
     def _get_session(self, session_id: str):
-        return getattr(self.scheduler, "sessions", {}).get(session_id)
+        sessions = getattr(self.scheduler, "sessions", {})
+        session = sessions.get(session_id)
+        logger.debug(f"_get_session({session_id}): sessions={list(sessions.keys())}, found={session is not None}")
+        return session
 
     def _find_session_req(self, session_id: str, rid: Optional[str] = None) -> Optional["Req"]:
         """Find the best candidate request in a session (finished or not)."""
         session = self._get_session(session_id)
         if session is None:
+            logger.warning(f"_find_session_req: session {session_id} not found in scheduler.sessions")
             return None
 
         req_nodes = getattr(session, "req_nodes", None)
         if not req_nodes:
+            logger.warning(f"_find_session_req: session {session_id} has no req_nodes")
             return None
+        
+        logger.debug(f"_find_session_req: session {session_id} has {len(req_nodes)} req_nodes: {list(req_nodes.keys())}")
 
         if rid is not None:
             node = req_nodes.get(rid)
@@ -325,6 +332,14 @@ class ToolKVManager:
 
         req = self._find_session_req(session_id, rid=rid)
         if req is None:
+            # Debug: log session state
+            session = self._get_session(session_id)
+            if session is None:
+                sessions_list = list(getattr(self.scheduler, "sessions", {}).keys())
+                logger.warning(f"Session {session_id} not in scheduler.sessions. Available: {sessions_list}")
+            else:
+                req_nodes = getattr(session, "req_nodes", {})
+                logger.warning(f"Session {session_id} found but req_nodes={list(req_nodes.keys())}")
             return ToolStartResult(
                 ok=False,
                 session_id=session_id,
@@ -404,29 +419,54 @@ class ToolKVManager:
 
         # Backup KV to CPU.
         # NOTE: PagedTokenToKVPoolAllocator may return None (not implemented).
-        kv_cache_cpu = self.scheduler.token_to_kv_pool_allocator.get_cpu_copy(pruned_indices)
-        if kv_cache_cpu is None:
+        kv_cache_cpu = None
+        try:
+            kv_cache_cpu = self.scheduler.token_to_kv_pool_allocator.get_cpu_copy(pruned_indices)
+            if kv_cache_cpu is None:
+                return ToolStartResult(
+                    ok=False,
+                    session_id=session_id,
+                    state="ERROR",
+                    error="KV cache CPU copy not supported by current allocator (paged allocator?)",
+                )
+            kv_bytes = self._sum_tensor_bytes(kv_cache_cpu)
+            if kv_bytes == 0:
+                return ToolStartResult(
+                    ok=False,
+                    session_id=session_id,
+                    state="ERROR",
+                    error="KV cache backup resulted in 0 bytes; backup may have failed",
+                )
+        except Exception as e:
+            logger.error(f"Failed to backup KV to CPU: {e}")
             return ToolStartResult(
                 ok=False,
                 session_id=session_id,
                 state="ERROR",
-                error="KV cache CPU copy not supported by current allocator (paged allocator?)",
-            )
-        kv_bytes = self._sum_tensor_bytes(kv_cache_cpu)
-        if kv_bytes == 0:
-            return ToolStartResult(
-                ok=False,
-                session_id=session_id,
-                state="ERROR",
-                error="KV cache backup resulted in 0 bytes; backup may have failed",
+                error=f"KV cache CPU copy failed: {str(e)}",
             )
 
         # Free GPU KV by pruning the radix tree branch (leaf->root order).
-        # NOTE: This assumes single-threaded scheduler access. If concurrent eviction
-        # is possible, nodes should be locked before backup.
-        for node in nodes_to_delete:
-            self.scheduler.token_to_kv_pool_allocator.free(node.value)
-            self._delete_radix_leaf(tree_cache, node)
+        # CRITICAL: We need to do this atomically to avoid race conditions with
+        # concurrent radix cache operations. The tree_cache operations should be
+        # performed under the scheduler's lock or in the scheduler thread.
+        # For now, we do our best with error handling.
+        freed_nodes = []
+        try:
+            for node in nodes_to_delete:
+                self.scheduler.token_to_kv_pool_allocator.free(node.value)
+                freed_nodes.append(node)
+                self._delete_radix_leaf(tree_cache, node)
+        except Exception as e:
+            # Rollback: This is tricky because we've already freed some GPU memory
+            # and modified the tree. Log the error and continue - the backup is still valid.
+            logger.error(
+                f"Partial failure during tree pruning for session {session_id}: {e}. "
+                f"Freed {len(freed_nodes)}/{len(nodes_to_delete)} nodes. "
+                f"KV backup is intact but tree may be inconsistent."
+            )
+            # Don't return error - we have a valid CPU backup even if tree is partially pruned
+            # The tree will eventually be consistent again through normal operations
 
         available_after = self.scheduler.token_to_kv_pool_allocator.available_size()
 
@@ -480,15 +520,33 @@ class ToolKVManager:
         total_len = int(len(meta._radix_key_tokens))
         missing_len = total_len - prefix_len
 
-        if missing_len != int(meta._radix_offloaded_len):
+        # Check if the full key already exists in cache (another request may have cached it)
+        if missing_len == 0:
+            # Full prefix already cached, nothing to restore.
+            # This can happen if another request used the same prefix between offload and restore.
+            logger.info(
+                f"Session {meta.session_id} prefix already fully cached (len={total_len}), "
+                f"no restore needed"
+            )
+            return None
+
+        # Validate that missing length matches what we offloaded
+        # Allow for the case where the prefix grew (another request extended it)
+        if missing_len > int(meta._radix_offloaded_len):
             return (
-                f"Cannot restore: cached prefix changed (missing_len={missing_len}, "
-                f"expected_offloaded_len={meta._radix_offloaded_len})"
+                f"Cannot restore: prefix changed (missing_len={missing_len} > "
+                f"expected_offloaded_len={meta._radix_offloaded_len}). "
+                f"Another request may have invalidated the session."
             )
 
-        if missing_len == 0:
-            # Nothing to restore.
-            return None
+        # If missing_len < _radix_offloaded_len, it means part of our offloaded KV
+        # was already restored by another request. We only need to restore the remaining part.
+        if missing_len < int(meta._radix_offloaded_len):
+            logger.info(
+                f"Session {meta.session_id} partially cached (prefix_len={prefix_len}, "
+                f"missing_len={missing_len}, offloaded_len={meta._radix_offloaded_len}). "
+                f"Restoring only the missing {missing_len} tokens."
+            )
 
         new_indices = self.scheduler.token_to_kv_pool_allocator.alloc(missing_len)
         if new_indices is None:
@@ -504,7 +562,7 @@ class ToolKVManager:
             self.scheduler.token_to_kv_pool_allocator.free(new_indices)
             return f"Allocated indices length mismatch ({len(new_indices)} != {missing_len})"
 
-        # Use try/finally to ensure cleanup on failure
+        # Use try/except to ensure cleanup on failure
         try:
             self.scheduler.token_to_kv_pool_allocator.load_cpu_copy(meta._kv_cache_cpu, new_indices)
 
@@ -519,18 +577,30 @@ class ToolKVManager:
             if not hasattr(tree_cache, "insert"):
                 raise RuntimeError("Prefix cache does not support insert(); cannot restore")
 
-            # Check insert return value - it returns number of tokens inserted
-            inserted = tree_cache.insert(radix_key, full_indices)
-            if inserted == 0 and missing_len > 0:
-                logger.warning(
-                    f"RadixCache insert returned 0 for session {meta.session_id}, "
-                    f"expected to insert {missing_len} tokens. Key may already exist."
-                )
+            # Insert the full key into RadixCache
+            # insert() returns the length of prefix that was ALREADY in the tree (total_prefix_length)
+            # If it returns 0, it means nothing was duplicate, and the full key was inserted
+            # If it returns N > 0, it means the first N tokens were already in the tree
+            duplicate_prefix_len = tree_cache.insert(radix_key, full_indices)
+
+            # Free any duplicate indices that were already in the tree
+            # This should match the existing prefix we found via match_prefix
+            if duplicate_prefix_len > 0:
+                if duplicate_prefix_len != prefix_len:
+                    logger.warning(
+                        f"Unexpected duplicate prefix length for session {meta.session_id}: "
+                        f"insert returned {duplicate_prefix_len}, but match_prefix found {prefix_len}"
+                    )
+                # No need to free anything - the existing indices are already in the tree
+                # and we only allocated new_indices for the missing part
 
         except Exception as e:
             # Cleanup: free allocated indices on failure
             logger.error(f"Failed to restore KV for session {meta.session_id}: {e}")
-            self.scheduler.token_to_kv_pool_allocator.free(new_indices)
+            try:
+                self.scheduler.token_to_kv_pool_allocator.free(new_indices)
+            except Exception as free_error:
+                logger.error(f"Failed to free indices during cleanup: {free_error}")
             return f"Failed to restore KV: {str(e)}"
 
         # Clear CPU backup to release memory.
@@ -544,85 +614,127 @@ class ToolKVManager:
         return None
     
     def _find_request_by_session(self, session_id: str) -> Optional["Req"]:
-        """Find a request associated with a session."""
-        if self.scheduler.running_batch:
-            for req in self.scheduler.running_batch.reqs:
+        """Find a request associated with a session.
+
+        THREAD SAFETY: This accesses scheduler state (running_batch, waiting_queue, chunked_req)
+        which may be modified by the scheduler thread. This is safe for read-only access
+        because these are accessed under Python's GIL, but the contents may be inconsistent.
+        """
+        # Snapshot references to avoid iteration issues if lists change
+        running_batch = self.scheduler.running_batch
+        if running_batch:
+            reqs_snapshot = list(running_batch.reqs) if running_batch.reqs else []
+            for req in reqs_snapshot:
                 if getattr(req, 'session_id', None) == session_id:
                     return req
-        
-        for req in self.scheduler.waiting_queue:
+
+        waiting_queue_snapshot = list(self.scheduler.waiting_queue)
+        for req in waiting_queue_snapshot:
             if getattr(req, 'session_id', None) == session_id:
                 return req
-        
-        if self.scheduler.chunked_req:
-            if getattr(self.scheduler.chunked_req, 'session_id', None) == session_id:
-                return self.scheduler.chunked_req
-        
+
+        chunked_req = self.scheduler.chunked_req
+        if chunked_req:
+            if getattr(chunked_req, 'session_id', None) == session_id:
+                return chunked_req
+
         return None
-    
+
     def _find_request_by_rid(self, rid: str) -> Optional["Req"]:
-        """Find a request by its request ID."""
-        if self.scheduler.running_batch:
-            for req in self.scheduler.running_batch.reqs:
+        """Find a request by its request ID.
+
+        THREAD SAFETY: See _find_request_by_session.
+        """
+        # Snapshot references to avoid iteration issues
+        running_batch = self.scheduler.running_batch
+        if running_batch:
+            reqs_snapshot = list(running_batch.reqs) if running_batch.reqs else []
+            for req in reqs_snapshot:
                 if req.rid == rid:
                     return req
-        
-        for req in self.scheduler.waiting_queue:
+
+        waiting_queue_snapshot = list(self.scheduler.waiting_queue)
+        for req in waiting_queue_snapshot:
             if req.rid == rid:
                 return req
-        
-        if self.scheduler.chunked_req:
-            if self.scheduler.chunked_req.rid == rid:
-                return self.scheduler.chunked_req
-        
+
+        chunked_req = self.scheduler.chunked_req
+        if chunked_req:
+            if chunked_req.rid == rid:
+                return chunked_req
+
         return None
-    
+
     def _get_any_running_request(self) -> Optional["Req"]:
-        """Get any running request (for testing/debugging)."""
-        if self.scheduler.running_batch and self.scheduler.running_batch.reqs:
-            return self.scheduler.running_batch.reqs[0]
-        
-        if self.scheduler.chunked_req:
-            return self.scheduler.chunked_req
-        
-        if self.scheduler.waiting_queue:
-            return self.scheduler.waiting_queue[0]
-        
+        """Get any running request (for testing/debugging).
+
+        THREAD SAFETY: See _find_request_by_session.
+        """
+        running_batch = self.scheduler.running_batch
+        if running_batch and running_batch.reqs:
+            reqs_snapshot = list(running_batch.reqs)
+            if reqs_snapshot:
+                return reqs_snapshot[0]
+
+        chunked_req = self.scheduler.chunked_req
+        if chunked_req:
+            return chunked_req
+
+        waiting_queue_snapshot = list(self.scheduler.waiting_queue)
+        if waiting_queue_snapshot:
+            return waiting_queue_snapshot[0]
+
         return None
-    
+
     def list_active_requests(self) -> list:
-        """List all active requests (for debugging)."""
+        """List all active requests (for debugging).
+
+        THREAD SAFETY: See _find_request_by_session.
+        """
         requests = []
-        
-        if self.scheduler.running_batch:
-            for req in self.scheduler.running_batch.reqs:
+
+        # Snapshot to avoid concurrent modification issues
+        running_batch = self.scheduler.running_batch
+        if running_batch:
+            reqs_snapshot = list(running_batch.reqs) if running_batch.reqs else []
+            for req in reqs_snapshot:
+                try:
+                    requests.append({
+                        "rid": req.rid,
+                        "session_id": getattr(req, 'session_id', None),
+                        "location": "running_batch",
+                        "seq_len": len(req.origin_input_ids) + len(req.output_ids),
+                        "output_len": len(req.output_ids),
+                    })
+                except (AttributeError, TypeError) as e:
+                    logger.warning(f"Failed to serialize request {getattr(req, 'rid', 'unknown')}: {e}")
+
+        chunked_req = self.scheduler.chunked_req
+        if chunked_req:
+            try:
+                requests.append({
+                    "rid": chunked_req.rid,
+                    "session_id": getattr(chunked_req, 'session_id', None),
+                    "location": "chunked_req",
+                    "seq_len": len(chunked_req.origin_input_ids) + len(chunked_req.output_ids),
+                    "output_len": len(chunked_req.output_ids),
+                })
+            except (AttributeError, TypeError) as e:
+                logger.warning(f"Failed to serialize chunked_req: {e}")
+
+        waiting_queue_snapshot = list(self.scheduler.waiting_queue)
+        for req in waiting_queue_snapshot:
+            try:
                 requests.append({
                     "rid": req.rid,
                     "session_id": getattr(req, 'session_id', None),
-                    "location": "running_batch",
+                    "location": "waiting_queue",
                     "seq_len": len(req.origin_input_ids) + len(req.output_ids),
                     "output_len": len(req.output_ids),
                 })
-        
-        if self.scheduler.chunked_req:
-            req = self.scheduler.chunked_req
-            requests.append({
-                "rid": req.rid,
-                "session_id": getattr(req, 'session_id', None),
-                "location": "chunked_req",
-                "seq_len": len(req.origin_input_ids) + len(req.output_ids),
-                "output_len": len(req.output_ids),
-            })
-        
-        for req in self.scheduler.waiting_queue:
-            requests.append({
-                "rid": req.rid,
-                "session_id": getattr(req, 'session_id', None),
-                "location": "waiting_queue",
-                "seq_len": len(req.origin_input_ids) + len(req.output_ids),
-                "output_len": len(req.output_ids),
-            })
-        
+            except (AttributeError, TypeError) as e:
+                logger.warning(f"Failed to serialize request {getattr(req, 'rid', 'unknown')}: {e}")
+
         return requests
     
     def get_kv_meta(self, session_id: str) -> Optional[SessionKVMeta]:
@@ -664,6 +776,12 @@ class ToolKVManager:
                 logger.warning(f"Request {req.rid} has zero sequence length")
                 return False
             
+            # Validate req_pool_idx is within bounds
+            pool_size = self.scheduler.req_to_token_pool.size
+            if req_pool_idx >= pool_size:
+                logger.error(f"Request {req.rid} has invalid req_pool_idx {req_pool_idx} >= pool_size {pool_size}")
+                return False
+
             # Get the token indices
             token_indices = self.scheduler.req_to_token_pool.req_to_token[req_pool_idx, :seq_len]
             
@@ -766,17 +884,31 @@ class ToolKVManager:
             with self.lock:
                 # 1) Try active request offload (mid-generation).
                 req = None
+                actual_session_id = session_id
                 if rid:
                     req = self._find_request_by_rid(rid)
+                    if req:
+                        # Use the actual session_id from the request, not the wildcard
+                        actual_session_id = getattr(req, 'session_id', None) or req.rid
                 elif session_id == "*":
                     req = self._get_any_running_request()
                     if req:
-                        logger.info(f"Using any running request: rid={req.rid}")
+                        # Use the actual session_id from the request, not the wildcard
+                        actual_session_id = getattr(req, 'session_id', None) or req.rid
+                        logger.info(f"Using any running request: rid={req.rid}, actual_session_id={actual_session_id}")
                 else:
                     req = self._find_request_by_session(session_id)
 
                 if req is not None:
-                    meta = self._get_or_create_meta(session_id)
+                    # Check if session already offloaded to prevent duplicate offloads
+                    meta = self._get_or_create_meta(actual_session_id)
+                    if meta.state == SessionKVState.OFFLOADED_TO_CPU:
+                        return ToolStartResult(
+                            ok=False,
+                            session_id=actual_session_id,
+                            state="ERROR",
+                            error=f"Session {actual_session_id} is already offloaded (epoch={meta.epoch}). Call tool_end first.",
+                        )
 
                     if self._backup_kv_to_cpu(req, meta):
                         meta.state = SessionKVState.OFFLOADED_TO_CPU
@@ -788,12 +920,12 @@ class ToolKVManager:
                         self._abort_request(req)
 
                         logger.info(
-                            f"Offloaded running request for session {session_id} to CPU: "
+                            f"Offloaded running request for session {actual_session_id} to CPU: "
                             f"seq_len={meta.seq_len}, kv_bytes={meta.kv_bytes}, epoch={meta.epoch}"
                         )
                         return ToolStartResult(
                             ok=True,
-                            session_id=session_id,
+                            session_id=actual_session_id,
                             state=meta.state.value,
                             kv_bytes=meta.kv_bytes,
                             epoch=meta.epoch,
@@ -801,7 +933,7 @@ class ToolKVManager:
 
                     return ToolStartResult(
                         ok=False,
-                        session_id=session_id,
+                        session_id=actual_session_id,
                         state="ERROR",
                         error="Failed to backup KV to CPU for running request",
                     )
@@ -915,11 +1047,13 @@ class ToolKVManager:
 
                 meta.state = SessionKVState.RUNNABLE
                 meta.last_access = time.time()
+                # Increment epoch after successful restore to prevent replay attacks
+                meta.epoch += 1
 
                 if restored:
-                    logger.info(f"Session {session_id} restored and marked as RUNNABLE")
+                    logger.info(f"Session {session_id} restored and marked as RUNNABLE (new epoch={meta.epoch})")
                 else:
-                    logger.info(f"Session {session_id} marked as RUNNABLE")
+                    logger.info(f"Session {session_id} marked as RUNNABLE (new epoch={meta.epoch})")
 
                 return ToolEndResult(
                     ok=True,

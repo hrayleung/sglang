@@ -252,3 +252,6 @@ outputs/
 
 # Eval Cache
 .longbench_cache/
+
+# agents
+CLAUDE.md
