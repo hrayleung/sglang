@@ -115,6 +115,7 @@ class HiRadixCache(RadixCache):
         self.ongoing_write_through = {}
         # record the node segments with ongoing load back
         self.ongoing_load_back = {}
+        self._load_back_lock = threading.RLock()
         # record the ongoing prefetch requests
         self.ongoing_prefetch = {}
         self.ongoing_backup = {}
@@ -308,9 +309,11 @@ class HiRadixCache(RadixCache):
                 break
             finish_count += 1
             # no need to sync across TP workers as batch forwarding is synced
-            for ack_id in ack_list:
-                end_node = self.ongoing_load_back.pop(ack_id)
-                self.dec_lock_ref(end_node)
+            with self._load_back_lock:
+                for ack_id in ack_list:
+                    end_node = self.ongoing_load_back.pop(ack_id, None)
+                    if end_node is not None:
+                        self.dec_lock_ref(end_node)
 
         # ACK until all events are processed
         del self.cache_controller.ack_load_queue[:finish_count]
@@ -467,6 +470,8 @@ class HiRadixCache(RadixCache):
         device_indices = self.load_back(node)
         if device_indices is None:
             logger.error(f"Failed to load back node {node.id}: OOM or threshold")
+            if release and node.host_ref_counter > 0:
+                node.release_host()
             return False
 
         # Wait for async load to complete
@@ -560,7 +565,8 @@ class HiRadixCache(RadixCache):
             # no sufficient GPU memory to load back KV caches
             return None
 
-        self.ongoing_load_back[last_hit_node.id] = last_hit_node
+        with self._load_back_lock:
+            self.ongoing_load_back[last_hit_node.id] = last_hit_node
         offset = 0
         for node in nodes_to_load:
             node.value = device_indices[offset : offset + len(node.host_value)]

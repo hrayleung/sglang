@@ -1826,6 +1826,16 @@ class Scheduler(
 
         if self.enable_hierarchical_cache:
             self.tree_cache.check_hicache_events()
+            tool_kv_mgr = getattr(self, "_tool_kv_manager", None)
+            if tool_kv_mgr is not None and hasattr(tool_kv_mgr, "cleanup_stale_sessions"):
+                now = time.time()
+                last = getattr(self, "_tool_kv_cleanup_last_ts", 0)
+                if now - last > 60:
+                    try:
+                        tool_kv_mgr.cleanup_stale_sessions()
+                    except Exception:
+                        logger.exception("Failed to cleanup stale tool KV sessions")
+                    self._tool_kv_cleanup_last_ts = now
 
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue)

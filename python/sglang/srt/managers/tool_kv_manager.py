@@ -1199,10 +1199,15 @@ class ToolKVManagerV2:
         # Check cached mapping first
         if session_id in self.session_to_last_node:
             node = self.session_to_last_node[session_id]
-            # Validate node is still valid (not garbage collected)
+            # Validate node is still valid (not garbage collected) and still attached/has payload
             if node is not None and hasattr(node, 'id'):
-                return node
-        
+                has_payload = getattr(node, "value", None) is not None or getattr(node, "host_value", None) is not None
+                attached = getattr(node, "parent", None) is not None
+                if has_payload and attached:
+                    return node
+            # drop stale mapping and fall back
+            self.session_to_last_node.pop(session_id, None)
+
         # Fall back to session-based lookup
         session = getattr(self.scheduler, "sessions", {}).get(session_id)
         if session is None:
